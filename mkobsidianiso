@@ -195,6 +195,57 @@ extract_modules() {
   fi
 }
 
+# Copy the kernel and initramfs from the rootfs (directory or squashfs) into
+# the ISO's /boot/ so GRUB can load them directly from iso9660 — without
+# loop-mounting the squashfs and decompressing kernel data through GRUB's
+# limited xz support. This matches how most live distros build their ISOs and
+# avoids a whole class of "GRUB squashfs xz" boot failures.
+extract_kernel_to_iso() {
+  local rootfs="$1"
+  local kernel_file="$2"      # absolute path inside the rootfs
+  local iso_boot="$3"         # destination: $iso_root/boot
+  local mount_needed=false
+  local mount_point=""
+  if [[ -f "$rootfs" ]]; then
+    mount_point="$WORKDIR/kernel_mount"
+    mkdir -p "$mount_point"
+    mount -o loop,ro "$rootfs" "$mount_point" || error "Failed to mount $rootfs for kernel extraction"
+    mount_needed=true
+    rootfs="$mount_point"
+  fi
+  local kver
+  kver=$(get_kernel_version_from_file "$kernel_file" h)
+  local kernel_basename
+  kernel_basename=$(basename "$kernel_file")
+  info "Copying kernel $kernel_basename to ISO /boot/..."
+  mkdir -p "$iso_boot"
+  cp "$rootfs/boot/$kernel_basename" "$iso_boot/$kernel_basename" \
+    || error "Failed to copy kernel $kernel_basename to ISO /boot/"
+  # Copy initramfs. Different distros use different naming conventions; try
+  # the common ones in priority order. We pick the first match.
+  local initramfs_found=false
+  for candidate in \
+      "initramfs-${kver}.img" \
+      "initrd-${kver}.img" \
+      "initrd.img-${kver}" \
+      "initrd.img"; do
+    if [[ -f "$rootfs/boot/$candidate" ]]; then
+      info "Copying initramfs $candidate to ISO /boot/..."
+      cp "$rootfs/boot/$candidate" "$iso_boot/$candidate" \
+        || error "Failed to copy initramfs $candidate to ISO /boot/"
+      initramfs_found=true
+      break
+    fi
+  done
+  if ! $initramfs_found; then
+    info "WARN: no initramfs found in /boot/ for kernel version '${kver}'. Boot may fail."
+    info "WARN: tried: initramfs-${kver}.img, initrd-${kver}.img, initrd.img-${kver}, initrd.img"
+  fi
+  if $mount_needed; then
+    umount "$mount_point"
+  fi
+}
+
 create_init_script() {
   local dest="$1"
   cat >"$dest" <<'INITEOF'
@@ -351,6 +402,38 @@ get_kernel_version_from_file() {
   fi
 }
 
+# Read /etc/obsidian/boot-cmdline from the rootfs (file or directory).
+# The file, if present, is written by per-distro mkobsidiansfs-* scripts and
+# declares the kernel cmdline that distro's initramfs needs for live boot.
+# %LABEL% in the file is substituted with the actual ISO volume label.
+# Returns the resolved cmdline on stdout, or nothing if the file is absent.
+read_boot_cmdline() {
+  local rootfs="$1"
+  local label="$2"
+  local mount_needed=false
+  local mount_point=""
+  if [[ -f "$rootfs" ]]; then
+    mount_point="$WORKDIR/cmdline_mount"
+    mkdir -p "$mount_point"
+    mount -o loop,ro "$rootfs" "$mount_point" 2>/dev/null || {
+      echo ""
+      return
+    }
+    mount_needed=true
+    rootfs="$mount_point"
+  fi
+  local cmdline=""
+  if [[ -f "$rootfs/etc/obsidian/boot-cmdline" ]]; then
+    # Read the file (first non-empty, non-comment line), strip trailing whitespace,
+    # substitute the label placeholder.
+    cmdline=$(grep -v '^\s*#' "$rootfs/etc/obsidian/boot-cmdline" | grep -v '^\s*$' | head -n1 | sed "s/%LABEL%/$label/g")
+  fi
+  if $mount_needed; then
+    umount "$mount_point" 2>/dev/null || true
+  fi
+  echo "$cmdline"
+}
+
 create_grub_cfg() {
   local dest="$1"
   local kernel_file="$2"
@@ -377,6 +460,27 @@ create_grub_cfg() {
   "initramfs_img_prefix") initrd_path="/boot/initramfs.img-$kernel_version" ;;
   "initrd_img_prefix") initrd_path="/boot/initrd.img-$kernel_version" ;;
   esac
+
+  # Check if the squashfs declares its own kernel cmdline. Per-distro
+  # mkobsidiansfs-* scripts write /etc/obsidian/boot-cmdline into the rootfs
+  # to tell us what their initramfs needs (e.g. dracut's root=live:LABEL=...).
+  # If present, use it and skip the legacy ventoy-init wrapper. If absent,
+  # keep the legacy behavior for backward compatibility.
+  local declared_cmdline=""
+  declared_cmdline=$(read_boot_cmdline "$rootfs" "OBOS_$ISO_NAME")
+
+  local base_cmdline=""
+  local initrd_chain=""
+  if [[ -n "$declared_cmdline" ]]; then
+    info "Using declared boot cmdline from /etc/obsidian/boot-cmdline"
+    base_cmdline="$declared_cmdline"
+    initrd_chain="$initrd_path"
+  else
+    info "No /etc/obsidian/boot-cmdline in rootfs; using legacy ventoy-init boot"
+    base_cmdline="root=LABEL=OBOS_$ISO_NAME rootfstype=iso9660 ro rdinit=/ventoy-init"
+    initrd_chain="$initrd_path (\$root)/ventoy.cpio"
+  fi
+
   cat >"$dest" <<EOF
 set default=0
 set timeout=10
@@ -386,9 +490,9 @@ menuentry "$DISTRO" {
     echo "=> mounting system image"
     loopback loop0 (\$root)/live/system.sfs
     echo "=> loading linux"
-    linux (loop0)/boot/$kernel_file root=LABEL=OBOS_$ISO_NAME rootfstype=iso9660 ro $toramline $EXTRA_BOOT_OPT rdinit=/ventoy-init
+    linux /boot/$kernel_file $base_cmdline $toramline $EXTRA_BOOT_OPT
     echo "=> loading initramfs"
-    initrd (loop0)$initrd_path (\$root)/ventoy.cpio
+    initrd $initrd_chain
     echo "=> booting"
     boot
 }
@@ -400,9 +504,9 @@ submenu 'Advanced Options for $DISTRO' {
         echo "=> mounting system image"
         loopback loop0 (\$root)/live/system.sfs
         echo "=> loading linux"
-        linux (loop0)/boot/$kernel_file root=LABEL=OBOS_$ISO_NAME ro obsidian.safemode obsidian.debug $EXTRA_BOOT_OPT rdinit=/ventoy-init
+        linux /boot/$kernel_file $base_cmdline obsidian.safemode obsidian.debug $EXTRA_BOOT_OPT
         echo "=> loading initramfs"
-        initrd (loop0)$initrd_path (\$root)/ventoy.cpio
+        initrd $initrd_chain
         echo "=> booting"
         boot
     }
@@ -413,9 +517,9 @@ submenu 'Advanced Options for $DISTRO' {
         echo "=> mounting system image"
         loopback loop0 (\$root)/live/system.sfs
         echo "=> loading linux"
-        linux (loop0)/boot/$kernel_file root=LABEL=OBOS_$ISO_NAME ro $nontoramline $EXTRA_BOOT_OPT rdinit=/ventoy-init
+        linux /boot/$kernel_file $base_cmdline $nontoramline $EXTRA_BOOT_OPT
         echo "=> loading initramfs"
-        initrd (loop0)$initrd_path (\$root)/ventoy.cpio
+        initrd $initrd_chain
         echo "=> booting"
         boot
     }
@@ -426,9 +530,9 @@ submenu 'Advanced Options for $DISTRO' {
         echo "=> mounting system image"
         loopback loop0 (\$root)/live/system.sfs
         echo "=> loading linux"
-        linux (loop0)/boot/$kernel_file root=LABEL=OBOS_$ISO_NAME ro obsidian.debug $EXTRA_BOOT_OPT rdinit=/ventoy-init
+        linux /boot/$kernel_file $base_cmdline obsidian.debug $EXTRA_BOOT_OPT
         echo "=> loading initramfs"
-        initrd (loop0)$initrd_path (\$root)/ventoy.cpio
+        initrd $initrd_chain
         echo "=> booting"
         boot
     }
@@ -439,9 +543,9 @@ submenu 'Advanced Options for $DISTRO' {
         echo "=> mounting system image"
         loopback loop0 (\$root)/live/system.sfs
         echo "=> loading linux"
-        linux (loop0)/boot/$kernel_file root=LABEL=OBOS_$ISO_NAME ro nomodeset $EXTRA_BOOT_OPT rdinit=/ventoy-init
+        linux /boot/$kernel_file $base_cmdline nomodeset $EXTRA_BOOT_OPT
         echo "=> loading initramfs"
-        initrd (loop0)$initrd_path (\$root)/ventoy.cpio
+        initrd $initrd_chain
         echo "=> booting"
         boot
     }
@@ -551,6 +655,7 @@ main() {
     error "Invalid rootfs type"
   fi
   extract_modules "$squashfs_file" "$kernel_file" "$iso_root/extras"
+  extract_kernel_to_iso "$squashfs_file" "$kernel_file" "$iso_root/boot"
   info "Adding extra files/directories"
   if [[ -n "$EXTRA_FILES" ]]; then
     for f in $EXTRA_FILES; do
@@ -602,13 +707,25 @@ EOF
   info "Adding Ventoy support..."
   cat >"$WORKDIR/ventoy-init" << 'EOF'
 #!/bin/sh
-for mod in dm-mod dm-bufio dm-snapshot; do
-    for ko in /lib/modules/*/kernel/drivers/md/${mod}.ko; do
-        insmod "$ko" 2>/dev/null && break
+
+if command -v modprobe >/dev/null 2>&1; then
+    modprobe dm-mod 2>/dev/null
+    modprobe dm-bufio 2>/dev/null
+    modprobe dm-snapshot 2>/dev/null
+else
+    for mod in dm-mod dm-bufio dm-snapshot; do
+        for ko in /lib/modules/*/kernel/drivers/md/${mod}.ko*; do
+            [ -e "$ko" ] && insmod "$ko" 2>/dev/null && break
+        done
     done
-done
+fi
+
+[ -d /dev/mapper ] || mkdir -p /dev/mapper
+[ -c /dev/mapper/control ] || mknod /dev/mapper/control c 10 236
+
 exec /init "$@"
 EOF
+
   chmod +x "$WORKDIR/ventoy-init"
   pushd "$WORKDIR"
   find "ventoy-init" | cpio -o -H newc > "$iso_root/ventoy.cpio"
@@ -616,7 +733,11 @@ EOF
   info "Creating GRUB configuration..."
   create_grub_cfg "$iso_root/boot/grub/grub.cfg" "$kernel_file" "$rootfs"
   info "Adding extra binaries"
-  cp $BINARIES "$iso_root/extras/binaries/" || true
+  if [[ -n "$BINARIES" ]]; then
+      cp $BINARIES "$iso_root/extras/binaries/" || error "Failed to copy binaries"
+  else
+      info "No extra binaries specified, skipping..."
+  fi
   info "Building ISO with grub-mkrescue..."
   cd "$old_pwd"
   grub-mkrescue -o "$output" "$iso_root" --product-name="$ISO_NAME" --product-version="$ISO_VERSION" -- -volid "OBOS_$ISO_NAME" || error "Failed to create ISO"
